@@ -12,6 +12,10 @@ mkdir -p "$OUT"
 # 而多出来的那层 shell 退出时会把 setsid 的子进程一起带走（v9 首次启动
 # 就是这么静默死掉的，日志 0 字节、进程无踪）。
 STEPS="${1:-100000000}"
+RESTORE="${2:-}"          # 可选：续训用的存档路径
+
+EXTRA=""
+[ -n "$RESTORE" ] && EXTRA="--restore $RESTORE"
 
 nohup setsid env XLA_PYTHON_CLIENT_PREALLOCATE=false \
     "$HOME/tools/rl/.venv/bin/python" -u rl_train.py \
@@ -20,6 +24,7 @@ nohup setsid env XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --steps "$STEPS" \
     --ep-len 500 \
     --out "$OUT" \
+    $EXTRA \
     > "$OUT/train.log" 2>&1 < /dev/null &
 
 PID=$!

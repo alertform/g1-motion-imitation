@@ -42,6 +42,10 @@ def main():
     ap.add_argument("--ep-len", type=int, default=500)
     ap.add_argument("--smoke", action="store_true", help="小规模冒烟测试")
     ap.add_argument("--out", default=str(pathlib.Path.home()/"tools"/"rl"/"runs"))
+    ap.add_argument("--restore", default="",
+                    help="从已有存档续训（policy.pkl / policy_latest.pkl）。"
+                         "注意 brax 不保存优化器状态和已用步数，"
+                         "续训等于用旧权重重新开始计步。")
     a = ap.parse_args()
 
     if a.smoke:
@@ -152,10 +156,21 @@ def main():
         seed=0,
     )
 
+    restore = None
+    if a.restore:
+        rp = pathlib.Path(a.restore)
+        if not rp.is_absolute():
+            rp = pathlib.Path(a.out).parent/rp
+        if not rp.exists():
+            raise SystemExit(f"续训存档不存在: {rp}")
+        restore = tuple(model.load_params(str(rp)))
+        print(f"从 {rp} 续训（{len(restore)} 组参数：normalizer/policy/value）")
+
     print("开始训练…")
     make_policy, params, _ = train_fn(
         environment=env, eval_env=eval_env,
-        progress_fn=progress, policy_params_fn=save_ckpt)
+        progress_fn=progress, policy_params_fn=save_ckpt,
+        restore_params=restore)
 
     dt = time.perf_counter() - t0
     print(f"\n训练完成，用时 {dt/60:.1f} 分钟")
