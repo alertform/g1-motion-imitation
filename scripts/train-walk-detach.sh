@@ -2,8 +2,8 @@
 # 以脱离会话的方式启动训练：setsid 让 python 不再属于本次 wsl 会话，
 # 本脚本立刻返回。日志直接落盘，进程生死与调用方无关。
 cd "$HOME/tools/rl" || exit 1
-cp /mnt/d/WSL/rl_env.py /mnt/d/WSL/rl_train.py /mnt/d/WSL/rl_play.py \
-   /mnt/d/WSL/rl_eval.py /mnt/d/WSL/rl_eval_mjx.py .
+cp /mnt/d/g1-imitation/src/rl/rl_env.py /mnt/d/g1-imitation/src/rl/rl_train.py /mnt/d/g1-imitation/src/rl/rl_play.py \
+   /mnt/d/g1-imitation/src/rl/rl_eval.py /mnt/d/g1-imitation/src/rl/rl_eval_mjx.py .
 
 OUT="$HOME/tools/rl/runs/walk"
 mkdir -p "$OUT"

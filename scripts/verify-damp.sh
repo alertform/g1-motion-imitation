@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 cd "$HOME/tools/rl" || exit 1
 source .venv/bin/activate
-cp /mnt/d/WSL/rl_env.py /mnt/d/WSL/rl_train.py /mnt/d/WSL/rl_play.py \
-   /mnt/d/WSL/rl_eval.py /mnt/d/WSL/rl_eval_mjx.py .
+cp /mnt/d/g1-imitation/src/rl/rl_env.py /mnt/d/g1-imitation/src/rl/rl_train.py /mnt/d/g1-imitation/src/rl/rl_play.py \
+   /mnt/d/g1-imitation/src/rl/rl_eval.py /mnt/d/g1-imitation/src/rl/rl_eval_mjx.py .
 export JAX_PLATFORMS=cpu
 python - <<'PYEOF' 2>&1 | grep -vE 'UserWarning|warnings.warn|Failed to import|cuda|CUDA'
 import numpy as np, mujoco

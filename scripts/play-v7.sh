@@ -8,6 +8,6 @@ export JAX_PLATFORMS=cpu          # 策略网络很小，别去占显存
 
 cd "$HOME/tools/rl" || exit 1
 source .venv/bin/activate
-cp /mnt/d/WSL/rl_play.py /mnt/d/WSL/rl_env.py .
+cp /mnt/d/g1-imitation/src/rl/rl_play.py /mnt/d/g1-imitation/src/rl/rl_env.py .
 
 exec python rl_play.py --ckpt runs/walk/policy.pkl "$@"
