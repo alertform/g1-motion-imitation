@@ -1,0 +1,28 @@
+# 数据集与训练产物（体积大，可重新生成）
+*.npz
+*.pkl
+*.bvh
+runs/
+g1_dataset/
+history.json
+train.log
+
+# 论文 PDF（版权 + 体积，见 papers/README.md 里的下载脚本）
+papers/**/*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# WSL 相关（绝不入库）
+*.vhdx
+*.msi
+Ubuntu-*/
