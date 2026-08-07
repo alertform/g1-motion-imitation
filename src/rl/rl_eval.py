@@ -75,6 +75,8 @@ def main():
     ap.add_argument("--clip", default="walk1_subject1")
     ap.add_argument("--episodes", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=500)
+    ap.add_argument("--starts", default="",
+                    help="逗号分隔的起始帧，指定后忽略 --episodes（用于定点复查）")
     a = ap.parse_args()
 
     import jax
@@ -93,11 +95,15 @@ def main():
     policy = rl_play.build_policy(ckpt, rl_env.OBS_SIZE, rl_env.NU)
     key = jax.random.PRNGKey(0)
 
-    # 起点均匀铺开，避免只测到动作里最容易的一段
-    span = roll.T - a.max_steps - rl_env.LOOKAHEAD - 2
-    starts = np.linspace(0, max(0, span), a.episodes).astype(int)
+    # 起点集与 max_steps 无关，两个评估脚本共用同一定义（见 rl_eval_mjx）
+    from rl_eval_mjx import eval_starts
+    if a.starts:
+        starts = np.array([int(s) for s in a.starts.split(",")])
+    else:
+        starts = eval_starts(roll.T, a.episodes)
 
-    print(f"存档 {ckpt.name}   动作 {a.clip}   {a.episodes} 段 × {a.max_steps} 步")
+    print(f"存档 {ckpt.name}   动作 {a.clip}   {len(starts)} 段 × {a.max_steps} 步")
+    print(f"起始帧: {starts.tolist()}")
     print()
     print(f"  {'起点':>7} {'步数':>6} {'跑满':>5} {'关节误差°':>10} "
           f"{'p95°':>7} {'根漂移cm':>9} {'朝向°':>7} {'脚滑cm/步':>10}")

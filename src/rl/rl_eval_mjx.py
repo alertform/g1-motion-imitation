@@ -26,6 +26,20 @@ import rl_env
 METRIC_KEYS = ("r_pose", "r_orient", "r_root", "r_rvel", "r_jvel",
                "r_alive", "r_effort", "pose_err", "root_err", "rvel_err")
 
+# 起点预留：起点集**必须与 max_steps 无关**，否则不同步数上限的评估
+# 之间无法纵向比较。踩过的坑：用 --max-steps 1000 和 1500 各评一次，
+# linspace 的终点跟着变，16 个起点整体挪位，我却把两次结果当同一组
+# 起点做了对比，得出「深蹲段已解决」的错误结论——实际那个起点
+# 根本不在第二次的采样里。
+EVAL_RESERVE = 1500     # 固定预留，与 max_steps 无关
+LOOKAHEAD_PAD = 8       # 给 LOOKAHEAD 和 +1 索引留的余量
+
+
+def eval_starts(T, episodes):
+    """固定起点集，只由片段长度和起点数量决定。"""
+    span = max(0, T - EVAL_RESERVE - LOOKAHEAD_PAD)
+    return np.linspace(0, span, episodes).astype(int)
+
 
 def make_state(env, clip, starts):
     """从指定参考帧构造初始 state，绕开 reset 的随机起点。"""
@@ -102,16 +116,25 @@ def main():
     ap.add_argument("--episodes", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=500)
     ap.add_argument("--zero", action="store_true", help="只测零动作基线")
+    ap.add_argument("--starts", default="",
+                    help="逗号分隔的起始帧，指定后忽略 --episodes（用于定点复查）")
     a = ap.parse_args()
 
     ref, refv = rl_env.load_reference([a.clip_name])
     env = rl_env.G1Imitate(ref, refv, ep_len=a.max_steps)
 
-    span = env._T - a.max_steps - rl_env.LOOKAHEAD - 2
-    starts = np.linspace(0, max(0, span), a.episodes).astype(int)
+    if a.starts:
+        starts = np.array([int(s) for s in a.starts.split(",")])
+    else:
+        starts = eval_starts(env._T, a.episodes)
+
+    if a.max_steps > EVAL_RESERVE:
+        print(f"  ⚠ max_steps={a.max_steps} 超过预留 {EVAL_RESERVE}，"
+              f"末尾起点会跑过参考末端（参考帧钳制在最后一帧）")
 
     print(f"引擎 MJX（与训练一致）   动作 {a.clip_name}   "
-          f"{a.episodes} 个起点 × {a.max_steps} 步")
+          f"{len(starts)} 个起点 × {a.max_steps} 步")
+    print(f"起始帧: {starts.tolist()}")
     print()
 
     rows = []
