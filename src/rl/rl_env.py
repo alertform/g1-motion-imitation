@@ -58,11 +58,47 @@ K_JVEL = 0.2                 # 0.50 分 @ 1.86rad/s RMS
 K_CATCH = 1.0                # 1/s，24cm 误差 -> 0.24m/s 追赶速度
 V_CATCH_MAX = 0.5            # m/s，限幅避免大误差时目标速度不可达
 
+# ---- 笛卡尔身体跟踪（替代关节角跟踪）----
+# 关节角误差**不区分杠杆**：髋差 10° 让整个身体位移十几厘米，腕差 10° 只动
+# 几厘米，但在 29 关节的均值里权重相同。深蹲姿态（frame 12060）恰恰是膝髋
+# 小角度偏差造成大空间位移的场景——v11~v13 三轮改动（阻尼、起点刷新、
+# per-joint 动作缩放）都没能救回它，跟踪先失效（21 步内关节误差 1.2°→8.2°）
+# 然后才失稳，指向奖励结构本身。
+# BeyondMimic 的做法：只跟踪笛卡尔空间的身体位姿，不设关节角项；
+# 全局位置/朝向由 anchor（骨盆）两项管，其余 body 跟踪**相对 anchor** 的
+# 位姿——这样「机器人在哪」和「摆成什么形状」被解耦。
+# 参考 papers/06-最新进展/BeyondMimic_GuidedDiffusion.pdf
+ANCHOR_BODY = "pelvis"
+TRACK_BODIES = (
+    "left_knee_link", "right_knee_link",
+    "left_ankle_roll_link", "right_ankle_roll_link",
+    "torso_link",
+    "left_elbow_link", "right_elbow_link",
+    "left_wrist_yaw_link", "right_wrist_yaw_link",
+)
+K_BODY = 44.4                # = 1/0.15²，0.90 分 @ 5cm，0.37 分 @ 15cm
+MAX_BODY_ERR = 0.09          # m²（均值），约 30cm RMS —— 早停阈值
+
+# RSI 起点过滤：MuJoCo 接触点（d.ncon）少于该数的帧不能作为回合起点。
+# 依据（对照实验，diag-contrast.sh）：frame 12060 四轮改动（阻尼、起点
+# 刷新、动作缩放、笛卡尔奖励）都救不回来，穷举初始状态后唯一以 -4.0σ
+# 区分成败的指标是 **d.ncon = 1**——支撑面退化成一个点。
+# 注意不能用「表面低于阈值的 geom 数」代替：12060 有 2 个 geom 贴地，
+# 但都在同一只脚上（支撑跨度仅 2×5cm），geom 计数会漏掉这种单点支撑
+# ——第一版实现就犯了这个错，被验证脚本抓出来。
+# 单点支撑的瞬间被 RSI「凭空放置」，没有此前积累的动量与接触历史，
+# 任何扰动都无法靠调整压力中心抵抗——这不是策略能力问题，是该帧
+# 物理上就不适合作为静态初始化的起点。
+MIN_START_CONTACTS = 2
+
 # 奖励权重（正项之和 = 1.0）。v7 只有位姿+根位置+朝向，缺速度项——
 # 位置误差会累积且不可逆：速度稍偏一点，位置就一路漂走再也回不来。
 # v7 实测根漂移中位 41cm，就是这么来的。
-W_POSE, W_ROOT, W_ORIENT = 0.35, 0.12, 0.08
-W_RVEL, W_JVEL, W_ALIVE = 0.20, 0.10, 0.15
+# v14：主项从关节角改为笛卡尔身体位置。关节角保留 0.10 作弱正则，
+# 防止「空间位置对但关节配置离谱」的解（IK 多解 / 镜像）。
+W_BODY = 0.30
+W_POSE, W_ROOT, W_ORIENT = 0.10, 0.12, 0.08
+W_RVEL, W_JVEL, W_ALIVE = 0.20, 0.05, 0.15
 
 # 早停阈值：跟丢多少就判定这个回合失败
 MAX_POSE_ERR = 0.6           # rad²（均值），约 44° RMS
@@ -72,8 +108,20 @@ MAX_ROOT_ERR = 0.36          # m²，即 60cm
 # v3 的教训：让策略从零输出绝对目标角，它必须每步「背出」整条轨迹，
 # 而输出 0 对应的是关节限位中点这种大字站姿。残差化之后输出 0 就是
 # 前馈跟踪参考，RL 只需要学修正量。真机上参考轨迹同样可得，不伤 sim2real。
-# kp=250 下 0.3 rad 残差约合 75 N·m，接近但不超过髋/膝 88~139 的力矩上限。
-ACT_SCALE = 0.3
+# 残差幅度改为 per-joint，不再用一个全局常数。
+#
+# 思路来自 BeyondMimic：幅度应正比于关节的力矩能力（踝 50 N·m vs 膝 139 N·m
+# 本就该有不同的修正范围）。但**不能照搬它的绝对公式** `0.25×力矩/kp`——
+# 那配的是他们 kp=14~99 的低增益，我们 kp=250 高 3~17 倍，同一公式算出
+# 0.29°~7.96°，实测比策略实际用量（p95 15~17°）小 13.6 倍，腕关节差 58 倍，
+# 等于把控制权威砍掉。
+#
+# 改为：保留 per-joint 的**相对比例**（∝ √力矩，避免腕/髋差 28 倍过于悬殊），
+# 再整体标定到 ACT_SCALE_REF，使中位数与原全局值相当。
+# 同时用行程做上限保护——踝 roll 行程仅 ±15°，原全局 0.3 rad 是行程的 115%，
+# 实测右踝截断率 20%（全关节平均仅 1.3%，所以这不是主要问题，但该修）。
+ACT_SCALE_REF = 0.3          # 标定基准：per-joint 幅度的中位数
+ACT_RANGE_FRAC = 0.6         # 上限保护：不超过关节半行程的这个比例
 
 # 位置伺服增益。**这是 v1~v5 全部失败的根因**：
 # g1_mjx.xml 号称「改用更低、更真实的 PD 增益」（kp=75/20, kd=2），
@@ -126,6 +174,18 @@ def _per_joint_kd(m):
         if any(k in nm for k in SUPPORT_KEYS):
             kd[i] = max(kd[i], KD_SUPPORT_MIN)
     return kd
+
+
+def act_scale(m):
+    """per-joint 残差幅度（rad）。见 ACT_SCALE_REF 注释。"""
+    jid = m.actuator_trnid[:m.nu, 0]
+    torque = np.abs(m.jnt_actfrcrange[jid]).max(axis=1)
+    # √力矩：腕 5 N·m 与髋 139 N·m 差 28 倍，开方后降到 5.3 倍，
+    # 既保留「强关节给更大修正范围」的意图，又不至于让弱关节几乎没权威
+    rel = np.sqrt(torque)
+    scale = ACT_SCALE_REF * rel / np.median(rel)
+    half_range = (m.jnt_range[jid, 1] - m.jnt_range[jid, 0]) / 2
+    return np.minimum(scale, ACT_RANGE_FRAC * half_range)
 
 
 def configure_model(m, sim_dt=0.004):
@@ -216,9 +276,36 @@ def _finite_diff_qvel(qpos, dt):
     return v
 
 
-def load_reference(names, ctrl_dt=0.02, max_frames=None):
-    """把若干段动作拼成 (N, T, NQ) 参考位姿 + (N, T, NV) 参考速度。
+def _body_states(qpos_seq, sim_dt=0.004):
+    """对参考轨迹逐帧做 FK：跟踪 body 的世界系位置 + 触地 geom 计数。
 
+    运行时在 MJX 里做 FK 太贵，且参考是固定的——一次算好存成数组。
+    返回 (身体位置 (T, 1+B, 3), 接触点数 (T,))。第 0 个 body 是 anchor。
+    接触计数直接用 MuJoCo 碰撞检测的 d.ncon（mj_forward 已含碰撞阶段），
+    不要自算「表面低于阈值的 geom 数」——12060 那帧有 2 个 geom 贴地但
+    都在同一只脚上，geom 计数漏掉单点支撑，第一版就栽在这。
+    """
+    m = configure_model(mujoco.MjModel.from_xml_path(str(XML)), sim_dt)
+    d = mujoco.MjData(m)
+    ids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, n)
+           for n in (ANCHOR_BODY,) + TRACK_BODIES]
+    assert all(i >= 0 for i in ids), "TRACK_BODIES 里有名字对不上模型"
+
+    out = np.zeros((len(qpos_seq), len(ids), 3))
+    ncon = np.zeros(len(qpos_seq), dtype=np.int8)
+    for t, q in enumerate(qpos_seq):
+        d.qpos[:] = q
+        mujoco.mj_forward(m, d)          # 只需运动学，不积分
+        out[t] = d.xpos[ids]
+        ncon[t] = min(d.ncon, 127)
+    return out, ncon
+
+
+def load_reference(names, ctrl_dt=0.02, max_frames=None):
+    """把若干段动作拼成参考库。
+
+    返回 (位姿 (N,T,NQ), 速度 (N,T,NV), 身体位置 (N,T,1+B,3))。
+    身体位置由 FK 预计算，运行时直接查表——见 _body_states。
     统一裁到相同长度以便向量化——不同长度会破坏 jit。
     """
     import numpy as np
@@ -237,15 +324,21 @@ def load_reference(names, ctrl_dt=0.02, max_frames=None):
     T = min(len(c) for c in poses)
     if max_frames:
         T = min(T, max_frames)
-    return (jp.asarray(np.stack([c[:T] for c in poses]), dtype=jp.float32),
-            jp.asarray(np.stack([c[:T] for c in vels]),  dtype=jp.float32))
+    poses = [c[:T] for c in poses]
+    fk = [_body_states(c) for c in poses]
+    bodies = [b for b, _ in fk]
+    ncons = [n for _, n in fk]
+    return (jp.asarray(np.stack(poses), dtype=jp.float32),
+            jp.asarray(np.stack([c[:T] for c in vels]), dtype=jp.float32),
+            jp.asarray(np.stack(bodies), dtype=jp.float32),
+            np.stack(ncons))                     # (N, T) 触地数，numpy 即可
 
 
 class G1Imitate(PipelineEnv):
     """单段/多段动作模仿。"""
 
-    def __init__(self, ref_qpos, ref_qvel, ctrl_dt=0.02, sim_dt=0.004,
-                 ep_len=500, **kwargs):
+    def __init__(self, ref_qpos, ref_qvel, ref_body, ref_ncon=None,
+                 ctrl_dt=0.02, sim_dt=0.004, ep_len=500, **kwargs):
         mj_model = configure_model(
             mujoco.MjModel.from_xml_path(str(XML)), sim_dt)
 
@@ -255,6 +348,11 @@ class G1Imitate(PipelineEnv):
 
         self._ref = ref_qpos                    # (N, T, NQ)，已重采样到控制率
         self._refv = ref_qvel                   # (N, T, NV)
+        self._refb = ref_body                   # (N, T, 1+B, 3) 世界系身体位置
+        # 机器人侧对应的 body id（顺序与 _body_states 一致：anchor 在前）
+        self._body_ids = jp.asarray(
+            [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, n)
+             for n in (ANCHOR_BODY,) + TRACK_BODIES])
         self._n_clip, self._T = ref_qpos.shape[0], ref_qpos.shape[1]
         self._mj_model = mj_model
 
@@ -266,9 +364,30 @@ class G1Imitate(PipelineEnv):
         # 误学成失败状态。
         self._max_start = max(1, self._T - ep_len - LOOKAHEAD - 2)
 
+        # 有效起点表：排除接触点不足的帧（见 MIN_START_CONTACTS 注释）。
+        # 各段的有效帧数不同，无法直接做规则数组——把每段的有效索引
+        # 循环平铺到统一长度 K，reset 时均匀抽列号即可（平铺余数带来的
+        # 采样偏差 < 1/K，可忽略）。
+        if ref_ncon is not None:
+            valid = []
+            for c in range(self._n_clip):
+                ok = np.where(np.asarray(ref_ncon[c][:self._max_start])
+                              >= MIN_START_CONTACTS)[0]
+                if len(ok) == 0:                   # 兜底：不过滤
+                    ok = np.arange(self._max_start)
+                valid.append(ok)
+            K = max(len(v) for v in valid)
+            table = np.stack([np.resize(v, K) for v in valid])
+            self._valid_starts = jp.asarray(table, dtype=jp.int32)   # (N, K)
+            self._n_valid = K
+        else:                                      # 兼容旧调用：均匀采样
+            self._valid_starts = None
+            self._n_valid = self._max_start
+
         # 关节限位，用于把残差目标钳制在合法范围内
         self._jnt_lo = jp.asarray(mj_model.jnt_range[1:, 0], dtype=jp.float32)
         self._jnt_hi = jp.asarray(mj_model.jnt_range[1:, 1], dtype=jp.float32)
+        self._act_scale = jp.asarray(act_scale(mj_model), dtype=jp.float32)
 
     # ------------------------------------------------------------ 工具
     def _phase(self, info):
@@ -331,8 +450,13 @@ class G1Imitate(PipelineEnv):
         rng, k1, k2 = jax.random.split(rng, 3)
         clip = jax.random.randint(k1, (), 0, self._n_clip)
         # 随机起始相位（RSI, reference state initialization）——
-        # DeepMimic 的关键技巧：不从头开始，否则后半段永远学不到
-        step = jax.random.randint(k2, (), 0, self._max_start)
+        # DeepMimic 的关键技巧：不从头开始，否则后半段永远学不到。
+        # 只从有效起点表里抽：单点支撑的帧不适合静态初始化（见表注释）
+        if self._valid_starts is not None:
+            j = jax.random.randint(k2, (), 0, self._n_valid)
+            step = self._valid_starts[clip, j]
+        else:
+            step = jax.random.randint(k2, (), 0, self._max_start)
 
         qpos, qvel = self._ref_at(clip, step)     # 位姿和速度都取自参考
         data = self.pipeline_init(qpos, qvel)
@@ -343,9 +467,9 @@ class G1Imitate(PipelineEnv):
         # 的重置中存活下来，见 _phase()
         info = {"clip": clip, "start": step, "step": step,
                 "last_act": last_act, "rng": rng}
-        metrics = {"r_pose": 0.0, "r_orient": 0.0, "r_root": 0.0,
-                   "r_rvel": 0.0, "r_jvel": 0.0,
-                   "r_alive": 0.0, "r_effort": 0.0,
+        metrics = {"r_body": 0.0, "r_pose": 0.0, "r_orient": 0.0,
+                   "r_root": 0.0, "r_rvel": 0.0, "r_jvel": 0.0,
+                   "r_alive": 0.0, "r_effort": 0.0, "body_err": 0.0,
                    "pose_err": 0.0, "root_err": 0.0, "rvel_err": 0.0}
         return State(data, obs, jp.zeros(()), jp.zeros(()), metrics, info)
 
@@ -354,15 +478,24 @@ class G1Imitate(PipelineEnv):
         nstep = self._phase(state.info) + 1
         ref, refv = self._ref_at(clip, nstep)
 
-        # 残差动作：目标 = 下一参考帧关节角 + 有界修正量
-        ctrl = jp.clip(ref[7:] + ACT_SCALE * jp.clip(action, -1.0, 1.0),
+        # 残差动作：目标 = 下一参考帧关节角 + 有界修正量（幅度按关节而异）
+        ctrl = jp.clip(ref[7:] + self._act_scale * jp.clip(action, -1.0, 1.0),
                        self._jnt_lo, self._jnt_hi)
         data = self.pipeline_step(state.pipeline_state, ctrl)
 
         # --- 跟踪误差 ---
-        # 关节误差用**均值**而不是求和。29 项求和会让 exp(-k·Σ) 在每关节
-        # 20° 处就掉到 1e-3，40°→20° 的改善拿不到任何回报，梯度消失，
-        # 策略退化成只优化存活项的「站着不动」。
+        # 主项改为**笛卡尔身体位置**（相对 anchor），不再用关节角。
+        # 关节角误差不区分杠杆，而空间位置天然按运动学杠杆加权。
+        # 相对 anchor 是为了把「机器人在哪」（下面的 root_err）和
+        # 「摆成什么形状」解耦——两者混在一起时会互相牵制。
+        rb = data.xpos[self._body_ids]                 # (1+B, 3) 机器人
+        tb = self._refb[clip, jp.clip(nstep, 0, self._T - 1)]   # 参考
+        rel_r = rb[1:] - rb[0]
+        rel_t = tb[1:] - tb[0]
+        body_err = jp.mean(jp.sum(jp.square(rel_r - rel_t), axis=-1))
+
+        # 关节角项保留但降权，作为姿态的弱正则（防止出现空间位置对、
+        # 但关节配置离谱的解，例如镜像或多解 IK）
         pose_err = jp.mean(jp.square(data.qpos[7:] - ref[7:]))
         root_err = jp.sum(jp.square(data.qpos[:3] - ref[:3]))
         quat_err = 1.0 - jp.abs(jp.dot(data.qpos[3:7], ref[3:7]))
@@ -372,6 +505,7 @@ class G1Imitate(PipelineEnv):
         rvel_err = jp.sum(jp.square(data.qvel[0:3] - vt))
         jvel_err = jp.mean(jp.square(data.qvel[6:] - refv[6:]))
 
+        r_body = jp.exp(-K_BODY * body_err)
         r_pose = jp.exp(-K_POSE * pose_err)
         r_root = jp.exp(-K_ROOT * root_err)
         r_orient = jp.exp(-K_ORIENT * quat_err)
@@ -383,14 +517,18 @@ class G1Imitate(PipelineEnv):
         # DeepMimic 的关键技巧：跟丢了就终止回合。不加这条的话，
         # 「无视参考、站着不摔」是个稳定的局部最优——它能稳拿存活分，
         # 而跟踪分反正也快拿不到。上一轮训练正是掉进了这里。
-        lost = (pose_err > MAX_POSE_ERR) | (root_err > MAX_ROOT_ERR)
+        # 早停也改用笛卡尔误差为主：关节角阈值放宽为兜底，
+        # 因为深蹲这类姿态下关节角误差不能准确反映「跟丢了没有」
+        lost = ((body_err > MAX_BODY_ERR)
+                | (pose_err > MAX_POSE_ERR)
+                | (root_err > MAX_ROOT_ERR))
         bad = fell | lost
         r_alive = jp.where(bad, 0.0, 1.0)
 
         r_effort = -0.001 * jp.sum(jp.square(action))
 
-        reward = (W_POSE*r_pose + W_ROOT*r_root + W_ORIENT*r_orient
-                  + W_RVEL*r_rvel + W_JVEL*r_jvel
+        reward = (W_BODY*r_body + W_POSE*r_pose + W_ROOT*r_root
+                  + W_ORIENT*r_orient + W_RVEL*r_rvel + W_JVEL*r_jvel
                   + W_ALIVE*r_alive + r_effort)
 
         # done = 摔倒或跟丢。参考播完不会在回合内发生（见 _max_start），
@@ -400,10 +538,10 @@ class G1Imitate(PipelineEnv):
         obs = self._obs(data, clip, nstep, action)
         state.info["step"] = nstep
         state.info["last_act"] = action
-        state.metrics.update(r_pose=r_pose, r_orient=r_orient, r_root=r_root,
-                             r_rvel=r_rvel, r_jvel=r_jvel,
+        state.metrics.update(r_body=r_body, r_pose=r_pose, r_orient=r_orient,
+                             r_root=r_root, r_rvel=r_rvel, r_jvel=r_jvel,
                              r_alive=r_alive, r_effort=r_effort,
-                             pose_err=pose_err, root_err=root_err,
-                             rvel_err=rvel_err)
+                             body_err=body_err, pose_err=pose_err,
+                             root_err=root_err, rvel_err=rvel_err)
         return state.replace(pipeline_state=data, obs=obs,
                              reward=reward, done=done)

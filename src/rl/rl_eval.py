@@ -82,7 +82,7 @@ def main():
     import jax
     import rl_env, rl_play
 
-    ref, refv = rl_env.load_reference([a.clip])
+    ref, refv, refb, refc = rl_env.load_reference([a.clip])
     ref, refv = np.asarray(ref[0]), np.asarray(refv[0])
     roll = rl_play.NumpyRollout(ref, refv)
 

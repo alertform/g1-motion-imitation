@@ -65,6 +65,7 @@ class NumpyRollout:
         self.T = len(self.ref)
         self.jnt_lo = self.m.jnt_range[1:, 0].copy()
         self.jnt_hi = self.m.jnt_range[1:, 1].copy()
+        self.act_scale = rl_env.act_scale(self.m)
 
     def obs(self, step, last_act):
         q, v = self.d.qpos, self.d.qvel
@@ -90,7 +91,7 @@ class NumpyRollout:
         """残差动作：目标 = 下一参考帧关节角 + 有界修正量（与 rl_env 一致）。"""
         ref_jnt = self.ref[min(step + 1, self.T - 1), 7:]
         self.d.ctrl[:] = np.clip(
-            ref_jnt + self.E.ACT_SCALE * np.clip(action, -1, 1),
+            ref_jnt + self.act_scale * np.clip(action, -1, 1),
             self.jnt_lo, self.jnt_hi)
         for _ in range(self.n_frames):
             mujoco.mj_step(self.m, self.d)
@@ -105,12 +106,12 @@ class NumpyRollout:
         return self.d.qpos[2] < 0.2 or upright < 0.0
 
 
-def consistency_check(roll, ref, refv):
+def consistency_check(roll, ref, refv, refb):
     """numpy 观测 vs rl_env 的 jax 观测，逐元素比对。"""
     import jax, jax.numpy as jp
     import rl_env
     env = rl_env.G1Imitate(jp.asarray(ref)[None], jp.asarray(refv)[None],
-                           ep_len=200)
+                           jp.asarray(refb)[None], ep_len=200)
     step = 100
     roll.reset(step, refv)
     last_act = np.zeros(rl_env.NU)
@@ -139,13 +140,14 @@ def main():
     a = ap.parse_args()
 
     import rl_env
-    ref, refv = rl_env.load_reference([a.clip])
+    ref, refv, refb, refc = rl_env.load_reference([a.clip])
     ref, refv = np.asarray(ref[0]), np.asarray(refv[0])
     roll = NumpyRollout(ref, refv)
 
     if a.check:
         print("=== numpy / jax 观测一致性 ===")
-        raise SystemExit(0 if consistency_check(roll, ref, refv) else 1)
+        raise SystemExit(0 if consistency_check(
+            roll, ref, refv, np.asarray(refb[0])) else 1)
 
     ckpt = pathlib.Path(a.ckpt)
     if not ckpt.is_absolute():

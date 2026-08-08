@@ -23,8 +23,9 @@ from brax.envs.base import State
 import jax_compat  # noqa: F401
 import rl_env
 
-METRIC_KEYS = ("r_pose", "r_orient", "r_root", "r_rvel", "r_jvel",
-               "r_alive", "r_effort", "pose_err", "root_err", "rvel_err")
+METRIC_KEYS = ("r_body", "r_pose", "r_orient", "r_root", "r_rvel", "r_jvel",
+               "r_alive", "r_effort", "body_err", "pose_err", "root_err",
+               "rvel_err")
 
 # 起点预留：起点集**必须与 max_steps 无关**，否则不同步数上限的评估
 # 之间无法纵向比较。踩过的坑：用 --max-steps 1000 和 1500 各评一次，
@@ -120,8 +121,8 @@ def main():
                     help="逗号分隔的起始帧，指定后忽略 --episodes（用于定点复查）")
     a = ap.parse_args()
 
-    ref, refv = rl_env.load_reference([a.clip_name])
-    env = rl_env.G1Imitate(ref, refv, ep_len=a.max_steps)
+    ref, refv, refb, refc = rl_env.load_reference([a.clip_name])
+    env = rl_env.G1Imitate(ref, refv, refb, refc, ep_len=a.max_steps)
 
     if a.starts:
         starts = np.array([int(s) for s in a.starts.split(",")])

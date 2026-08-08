@@ -64,13 +64,13 @@ def main():
         print(f"  {r['name']:<32}{r['frames']:>6} 帧  {r['grade']}")
     print()
 
-    ref, refv = rl_env.load_reference(names)
+    ref, refv, refb, refc = rl_env.load_reference(names)
     print(f"参考库 shape = {ref.shape}   (段数, 帧数, nq)   已重采样到 50Hz")
     print(f"设备: {jax.devices()}")
     print()
 
-    env = rl_env.G1Imitate(ref, refv, ep_len=a.ep_len)
-    eval_env = rl_env.G1Imitate(ref, refv, ep_len=a.ep_len)
+    env = rl_env.G1Imitate(ref, refv, refb, refc, ep_len=a.ep_len)
+    eval_env = rl_env.G1Imitate(ref, refv, refb, refc, ep_len=a.ep_len)
 
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -123,6 +123,14 @@ def main():
         num_minibatches=n_minibatch,
         unroll_length=20,
         num_updates_per_batch=4,
+        # brax 默认 0 意味着 env.reset() **整个训练只调用一次**：4096 个
+        # 环境的 RSI 起点在开头抽定后永远冻结，AutoResetWrapper 每次都恢复
+        # 到 first_pipeline_state。跑 500M 步 = 每个环境把自己那一个起点
+        # 重复几万遍，起点分布毫无补充。
+        # 设为 1 后每个 eval epoch 重抽一次，500M 步下约 250 次 × 4096 =
+        # 100 万次起点采样（原来只有 4096 次）。
+        # 见 brax/training/agents/ppo/train.py:823
+        num_resets_per_eval=1,
         learning_rate=3e-4,
         # v2 的教训：奖励修好后策略反而在 ~10M 步后崩掉（回合长
         # 35→25→14，但每步回报稳定）——跟踪质量没退化，是更新本身在
