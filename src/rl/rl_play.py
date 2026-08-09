@@ -6,7 +6,7 @@
 
 用法:
     python rl_play.py                       # 放最新存档
-    python rl_play.py --ckpt runs/walk_v11_final/policy.pkl
+    python rl_play.py --ckpt runs/walk_v15_startfilter/policy.pkl
     python rl_play.py --check               # 只做一致性自检，不开窗口
 """
 import argparse
