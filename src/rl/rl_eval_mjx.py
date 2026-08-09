@@ -119,28 +119,37 @@ def main():
     ap.add_argument("--zero", action="store_true", help="只测零动作基线")
     ap.add_argument("--starts", default="",
                     help="逗号分隔的起始帧，指定后忽略 --episodes（用于定点复查）")
+    ap.add_argument("--clips", default="",
+                    help="逗号分隔的多段动作名；给了就忽略 --clip-name")
+    ap.add_argument("--clip-idx", type=int, default=0,
+                    help="多段时评估第几段")
     a = ap.parse_args()
 
-    ref, refv, refb, refc = rl_env.load_reference([a.clip_name])
-    env = rl_env.G1Imitate(ref, refv, refb, refc, ep_len=a.max_steps)
+    names = ([s.strip() for s in a.clips.split(",")] if a.clips
+             else [a.clip_name])
+    ref, refv, refb, refc, refl = rl_env.load_reference(names)
+    env = rl_env.G1Imitate(ref, refv, refb, refc, refl, ep_len=a.max_steps)
+    ci = min(a.clip_idx, len(names) - 1)
+    clip_len = int(np.asarray(refl)[ci])
 
     if a.starts:
         starts = np.array([int(s) for s in a.starts.split(",")])
     else:
-        starts = eval_starts(env._T, a.episodes)
+        starts = eval_starts(clip_len, a.episodes)
 
     if a.max_steps > EVAL_RESERVE:
         print(f"  ⚠ max_steps={a.max_steps} 超过预留 {EVAL_RESERVE}，"
               f"末尾起点会跑过参考末端（参考帧钳制在最后一帧）")
 
-    print(f"引擎 MJX（与训练一致）   动作 {a.clip_name}   "
+    print(f"引擎 MJX（与训练一致）   动作 {names[ci]}"
+          f"{f' [{ci+1}/{len(names)}]' if len(names) > 1 else ''}   "
           f"{len(starts)} 个起点 × {a.max_steps} 步")
-    print(f"起始帧: {starts.tolist()}")
+    print(f"起始帧: {starts.tolist()}   （该段 {clip_len} 帧）")
     print()
 
     rows = []
     print("  零动作前馈基线…")
-    rows.append(("零动作前馈",) + rollout(env, starts, None, a.max_steps))
+    rows.append(("零动作前馈",) + rollout(env, starts, None, a.max_steps, ci))
 
     if not a.zero:
         import rl_play
@@ -151,7 +160,7 @@ def main():
             raise SystemExit(f"存档不存在: {ck}")
         pol = rl_play.build_policy(ck, rl_env.OBS_SIZE, rl_env.NU)
         print(f"  训练策略 {ck.name}…")
-        rows.append(("训练后策略",) + rollout(env, starts, pol, a.max_steps))
+        rows.append(("训练后策略",) + rollout(env, starts, pol, a.max_steps, ci))
 
     print()
     print(f"  {'':>12} {'存活均值':>9} {'中位':>7} {'关节误差°':>10} "

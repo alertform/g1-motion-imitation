@@ -304,41 +304,57 @@ def _body_states(qpos_seq, sim_dt=0.004):
 def load_reference(names, ctrl_dt=0.02, max_frames=None):
     """把若干段动作拼成参考库。
 
-    返回 (位姿 (N,T,NQ), 速度 (N,T,NV), 身体位置 (N,T,1+B,3))。
-    身体位置由 FK 预计算，运行时直接查表——见 _body_states。
-    统一裁到相同长度以便向量化——不同长度会破坏 jit。
+    返回 (位姿 (N,T,NQ), 速度 (N,T,NV), 身体位置 (N,T,1+B,3),
+          接触数 (N,T), 各段真实长度 (N,))。
+
+    **补齐而不是裁齐。** jit 要求规则数组，早期实现裁到 min(长度)——
+    68 段数据里最短的 fallAndGetUp3 只有 5109 帧，会把 15286 帧的长段
+    一起砍掉，浪费 52.4% 的数据。改为补齐到 max：末帧重复填充（不是补零，
+    补零会让参考跳到原点，早停立刻触发），另外返回真实长度，
+    RSI 采样和参考索引都按各段自己的长度来。
+    显存代价可接受：68 段补齐到 15286 帧约 420MB。
     """
     import numpy as np
     dst_fps = 1.0 / ctrl_dt
-    poses, vels = [], []
+    poses, vels, keep = [], [], []
     for n in names:
         p = DATASET/f"{n}.npz"
         if not p.exists():
             continue
         z = np.load(p)
         q = _resample(z["qpos"], float(z["fps"]), dst_fps)
+        if max_frames:
+            q = q[:max_frames]
         poses.append(q)
         vels.append(_finite_diff_qvel(q, ctrl_dt))
+        keep.append(n)
     if not poses:
         raise SystemExit(f"没找到任何动作，检查 {DATASET}")
-    T = min(len(c) for c in poses)
-    if max_frames:
-        T = min(T, max_frames)
-    poses = [c[:T] for c in poses]
-    fk = [_body_states(c) for c in poses]
-    bodies = [b for b, _ in fk]
-    ncons = [n for _, n in fk]
-    return (jp.asarray(np.stack(poses), dtype=jp.float32),
-            jp.asarray(np.stack([c[:T] for c in vels]), dtype=jp.float32),
-            jp.asarray(np.stack(bodies), dtype=jp.float32),
-            np.stack(ncons))                     # (N, T) 触地数，numpy 即可
+
+    lens = np.array([len(c) for c in poses], dtype=np.int32)
+    T = int(lens.max())
+
+    def pad(arr):
+        """末帧重复补齐到 T。"""
+        if len(arr) >= T:
+            return arr[:T]
+        tail = np.repeat(arr[-1:], T - len(arr), axis=0)
+        return np.concatenate([arr, tail], axis=0)
+
+    fk = [_body_states(pad(c)) for c in poses]
+    return (jp.asarray(np.stack([pad(c) for c in poses]), dtype=jp.float32),
+            jp.asarray(np.stack([pad(c) for c in vels]), dtype=jp.float32),
+            jp.asarray(np.stack([b for b, _ in fk]), dtype=jp.float32),
+            np.stack([n for _, n in fk]),        # (N, T) 接触数，numpy 即可
+            lens)                                 # (N,) 各段真实长度
 
 
 class G1Imitate(PipelineEnv):
     """单段/多段动作模仿。"""
 
     def __init__(self, ref_qpos, ref_qvel, ref_body, ref_ncon=None,
-                 ctrl_dt=0.02, sim_dt=0.004, ep_len=500, **kwargs):
+                 ref_lens=None, ctrl_dt=0.02, sim_dt=0.004, ep_len=500,
+                 **kwargs):
         mj_model = configure_model(
             mujoco.MjModel.from_xml_path(str(XML)), sim_dt)
 
@@ -359,10 +375,18 @@ class G1Imitate(PipelineEnv):
         # 参考已经在控制率上，一个控制步正好前进一帧
         self._ref_stride = 1
 
+        # 各段的真实长度（补齐前）。参考索引必须按各自长度钳制，
+        # 否则短段会一直读到补齐区的重复末帧。
+        if ref_lens is None:
+            ref_lens = np.full(self._n_clip, self._T, dtype=np.int32)
+        self._lens = jp.asarray(np.asarray(ref_lens), dtype=jp.int32)
+
         # RSI 起点上界：留出整个回合的余量，这样回合内永远不会播完参考。
         # 否则「参考播完」会和「摔倒」共用 done，价值函数会把片段结束
-        # 误学成失败状态。
-        self._max_start = max(1, self._T - ep_len - LOOKAHEAD - 2)
+        # 误学成失败状态。多段时每段的上界不同。
+        max_start = np.maximum(1, np.asarray(ref_lens) - ep_len - LOOKAHEAD - 2)
+        self._max_start_arr = jp.asarray(max_start, dtype=jp.int32)
+        self._max_start = int(max_start.min())     # 兼容旧代码的标量引用
 
         # 有效起点表：排除接触点不足的帧（见 MIN_START_CONTACTS 注释）。
         # 各段的有效帧数不同，无法直接做规则数组——把每段的有效索引
@@ -371,10 +395,11 @@ class G1Imitate(PipelineEnv):
         if ref_ncon is not None:
             valid = []
             for c in range(self._n_clip):
-                ok = np.where(np.asarray(ref_ncon[c][:self._max_start])
+                lim = int(max_start[c])
+                ok = np.where(np.asarray(ref_ncon[c][:lim])
                               >= MIN_START_CONTACTS)[0]
                 if len(ok) == 0:                   # 兜底：不过滤
-                    ok = np.arange(self._max_start)
+                    ok = np.arange(lim)
                 valid.append(ok)
             K = max(len(v) for v in valid)
             table = np.stack([np.resize(v, K) for v in valid])
@@ -405,14 +430,18 @@ class G1Imitate(PipelineEnv):
             return info["start"] + info["steps"].astype(jp.int32)
         return info["step"]                       # 裸环境（自测/回放）
 
+    def _last(self, clip):
+        """该段的最后一个有效帧下标（补齐区不算）。"""
+        return self._lens[clip] - 1
+
     def _ref_at(self, clip, step):
-        """取参考帧，超出末尾则钳制。"""
-        idx = jp.clip(step, 0, self._T - 1)
+        """取参考帧，超出该段末尾则钳制（按各段真实长度，不是补齐后的 T）。"""
+        idx = jp.clip(step, 0, self._last(clip))
         return self._ref[clip, idx], self._refv[clip, idx]
 
     def _ref_future(self, clip, step):
         """一次取出未来 LOOKAHEAD 帧的关节角。"""
-        idx = jp.clip(step + jp.arange(1, LOOKAHEAD + 1), 0, self._T - 1)
+        idx = jp.clip(step + jp.arange(1, LOOKAHEAD + 1), 0, self._last(clip))
         return self._ref[clip, idx, 7:].reshape(-1)
 
     @staticmethod
@@ -489,7 +518,7 @@ class G1Imitate(PipelineEnv):
         # 相对 anchor 是为了把「机器人在哪」（下面的 root_err）和
         # 「摆成什么形状」解耦——两者混在一起时会互相牵制。
         rb = data.xpos[self._body_ids]                 # (1+B, 3) 机器人
-        tb = self._refb[clip, jp.clip(nstep, 0, self._T - 1)]   # 参考
+        tb = self._refb[clip, jp.clip(nstep, 0, self._last(clip))]   # 参考
         rel_r = rb[1:] - rb[0]
         rel_t = tb[1:] - tb[0]
         body_err = jp.mean(jp.sum(jp.square(rel_r - rel_t), axis=-1))

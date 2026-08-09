@@ -106,12 +106,13 @@ class NumpyRollout:
         return self.d.qpos[2] < 0.2 or upright < 0.0
 
 
-def consistency_check(roll, ref, refv, refb):
+def consistency_check(roll, ref, refv, refb, refc, refl):
     """numpy 观测 vs rl_env 的 jax 观测，逐元素比对。"""
     import jax, jax.numpy as jp
     import rl_env
     env = rl_env.G1Imitate(jp.asarray(ref)[None], jp.asarray(refv)[None],
-                           jp.asarray(refb)[None], ep_len=200)
+                           jp.asarray(refb)[None], refc[None], refl[None],
+                           ep_len=200)
     step = 100
     roll.reset(step, refv)
     last_act = np.zeros(rl_env.NU)
@@ -140,14 +141,15 @@ def main():
     a = ap.parse_args()
 
     import rl_env
-    ref, refv, refb, refc = rl_env.load_reference([a.clip])
+    ref, refv, refb, refc, refl = rl_env.load_reference([a.clip])
     ref, refv = np.asarray(ref[0]), np.asarray(refv[0])
     roll = NumpyRollout(ref, refv)
 
     if a.check:
         print("=== numpy / jax 观测一致性 ===")
         raise SystemExit(0 if consistency_check(
-            roll, ref, refv, np.asarray(refb[0])) else 1)
+            roll, ref, refv, np.asarray(refb[0]),
+            np.asarray(refc[0]), np.asarray(refl[0])) else 1)
 
     ckpt = pathlib.Path(a.ckpt)
     if not ckpt.is_absolute():

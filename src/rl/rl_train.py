@@ -64,13 +64,18 @@ def main():
         print(f"  {r['name']:<32}{r['frames']:>6} 帧  {r['grade']}")
     print()
 
-    ref, refv, refb, refc = rl_env.load_reference(names)
-    print(f"参考库 shape = {ref.shape}   (段数, 帧数, nq)   已重采样到 50Hz")
+    ref, refv, refb, refc, refl = rl_env.load_reference(names)
+    import numpy as np
+    print(f"参考库 shape = {ref.shape}   (段数, 补齐帧数, nq)   已重采样到 50Hz")
+    print(f"  真实长度 {int(refl.min())}~{int(refl.max())} 帧，"
+          f"合计 {int(refl.sum()):,} 帧 = {refl.sum()*0.02/60:.1f} 分钟")
+    print(f"  补齐利用率 {refl.sum()/(len(refl)*ref.shape[1])*100:.1f}%"
+          f"（补齐区末帧重复，RSI 与索引均按真实长度）")
     print(f"设备: {jax.devices()}")
     print()
 
-    env = rl_env.G1Imitate(ref, refv, refb, refc, ep_len=a.ep_len)
-    eval_env = rl_env.G1Imitate(ref, refv, refb, refc, ep_len=a.ep_len)
+    env = rl_env.G1Imitate(ref, refv, refb, refc, refl, ep_len=a.ep_len)
+    eval_env = rl_env.G1Imitate(ref, refv, refb, refc, refl, ep_len=a.ep_len)
 
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
