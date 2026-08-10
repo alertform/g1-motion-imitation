@@ -51,10 +51,17 @@ class NumpyRollout:
     --check 会拿 rl_env 的 jax 版本逐元素对一遍，专门防这个漂移。
     """
 
-    def __init__(self, ref, refv, ctrl_dt=0.02, sim_dt=0.004):
+    def __init__(self, ref, refv, ctrl_dt=0.02, sim_dt=0.004,
+                 clip=0, n_clip=1):
         import rl_env
         self.E = rl_env
         self.refv = np.asarray(refv)                  # 观测里要用参考速度
+        # 动作条件必须和 rl_env 用同一套生成方式（同种子、同单位化），
+        # 否则回放时策略拿到的身份指纹和训练时不是同一个
+        rng = np.random.default_rng(20260810)
+        emb = rng.standard_normal((n_clip, rl_env.CLIP_EMBED_DIM)).astype(np.float32)
+        emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+        self.clip_emb = emb[clip]
         # 走 rl_env 的同一个配置函数：求解器、增益全部一致，
         # 否则回放的是另一个物理系统，测出的误差不代表训练时的表现
         self.m = rl_env.configure_model(
@@ -85,7 +92,7 @@ class NumpyRollout:
         idx = np.clip(step + np.arange(1, self.E.LOOKAHEAD + 1), 0, self.T - 1)
         fut = self.ref[idx, 7:].reshape(-1)
         return np.concatenate([grav, v[3:6], q[7:], v[6:], last_act,
-                               rt @ vt, rt @ perr, fut])
+                               rt @ vt, rt @ perr, self.clip_emb, fut])
 
     def apply(self, action, step):
         """残差动作：目标 = 下一参考帧关节角 + 有界修正量（与 rl_env 一致）。"""
@@ -138,12 +145,19 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0,
                     help="回放倍速，1.0 为实时；0.25 便于看清失衡瞬间")
     ap.add_argument("--check", action="store_true", help="只做一致性自检")
+    ap.add_argument("--clip-idx", type=int, default=0,
+                    help="该段在训练集里的索引（多段策略必须对齐，"
+                         "否则动作条件不匹配）")
+    ap.add_argument("--n-clip", type=int, default=1,
+                    help="训练时用了几段（决定 embedding 表的大小）")
     a = ap.parse_args()
 
     import rl_env
     ref, refv, refb, refc, refl = rl_env.load_reference([a.clip])
     ref, refv = np.asarray(ref[0]), np.asarray(refv[0])
-    roll = NumpyRollout(ref, refv)
+    # 单段回放：clip=0/n_clip=1。若策略是多段训练的，这里的身份指纹
+    # 与训练时不同——用 --clip-idx/--n-clip 对齐（见下）
+    roll = NumpyRollout(ref, refv, clip=a.clip_idx, n_clip=a.n_clip)
 
     if a.check:
         print("=== numpy / jax 观测一致性 ===")

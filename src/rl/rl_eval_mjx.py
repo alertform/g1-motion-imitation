@@ -63,51 +63,59 @@ def make_state(env, clip, starts):
 
 
 def rollout(env, starts, policy, max_steps, clip=0):
-    """跑到全部结束或步数上限，返回每个起点的存活步数与跟踪误差。"""
+    """跑到全部结束或步数上限，返回每个起点的存活步数与跟踪误差。
+
+    三处曾经的性能坑（实测 GPU 只有 3% 占用，瓶颈全在这个循环）：
+      1. 策略推理逐个起点调用 —— 6 个起点就是 6 次小推理，
+         每次都有 Python↔JAX 往返。改成 vmap 一次算完。
+      2. 每步 `np.asarray(...)` 把 metrics 同步回主机 —— 强制等待 GPU，
+         流水线断掉。改成累加留在设备上，循环结束再取。
+      3. 每步用 Python 循环逐元素累加 —— 改成掩码向量化。
+    """
     st = make_state(env, clip, starts)
     step_fn = jax.jit(jax.vmap(env.step))
     n = len(starts)
+    pol_fn = None
+    if policy is not None:
+        key = jax.random.PRNGKey(0)
+        pol_fn = jax.jit(jax.vmap(lambda o: policy(o, key)[0]))
 
-    alive = np.ones(n, dtype=bool)
-    surv = np.full(n, max_steps, dtype=int)
-    pose_acc = [[] for _ in range(n)]
-    root_acc = [[] for _ in range(n)]      # 根位置误差，速度奖励的直接目标
-    rvel_acc = [[] for _ in range(n)]
-    act_mag = []
-    key = jax.random.PRNGKey(0)
+    # 累加器留在设备上，避免每步同步
+    alive_d = jp.ones(n)
+    surv_d = jp.zeros(n)
+    pose_s = jp.zeros(n); root_s = jp.zeros(n); rvel_s = jp.zeros(n)
+    act_s = jp.zeros(())
+    zero_act = jp.zeros((n, rl_env.NU))
 
+    steps_run = 0
     for i in range(max_steps):
-        if policy is None:
-            act = jp.zeros((n, rl_env.NU))
-        else:
-            act = jp.stack([policy(st.obs[k], key)[0] for k in range(n)])
-        act_mag.append(float(jp.abs(act).mean()))
+        act = zero_act if pol_fn is None else pol_fn(st.obs)
+        act_s = act_s + jp.abs(act).mean()
         st = step_fn(st, act)
 
-        pe = np.asarray(st.metrics["pose_err"])
-        re = np.asarray(st.metrics["root_err"])
-        ve = np.asarray(st.metrics["rvel_err"])
-        for k in range(n):
-            if alive[k]:
-                pose_acc[k].append(pe[k])
-                root_acc[k].append(re[k])
-                rvel_acc[k].append(ve[k])
+        # 只累加仍存活的环境（掩码乘法，不做 Python 分支）
+        pose_s = pose_s + st.metrics["pose_err"] * alive_d
+        root_s = root_s + st.metrics["root_err"] * alive_d
+        rvel_s = rvel_s + st.metrics["rvel_err"] * alive_d
+        surv_d = surv_d + alive_d                 # 存活步数 = 存活标志的累加
+        alive_d = alive_d * (1.0 - st.done)
+        steps_run = i + 1
 
-        done = np.asarray(st.done).astype(bool)
-        newly = alive & done
-        surv[newly] = i + 1
-        alive &= ~done
-        if not alive.any():
+        # 每 50 步才同步一次，判断是否全部结束
+        if i % 50 == 49 and float(jp.sum(alive_d)) == 0.0:
             break
 
+    surv = np.asarray(surv_d).astype(int)
+    cnt = np.maximum(surv, 1)
+    pose_m = np.asarray(pose_s)/cnt
+    root_m = np.asarray(root_s)/cnt
+    rvel_m = np.asarray(rvel_s)/cnt
     # pose_err 是 rad² 均值 -> 度；root_err 是 m² -> cm；rvel_err 是 (m/s)² -> m/s
-    jerr = np.array([np.degrees(np.sqrt(np.mean(p))) if p else np.nan
-                     for p in pose_acc])
-    rerr = np.array([np.sqrt(np.mean(p))*100 if p else np.nan
-                     for p in root_acc])
-    verr = np.array([np.sqrt(np.mean(p)) if p else np.nan
-                     for p in rvel_acc])
-    return surv, jerr, rerr, verr, float(np.mean(act_mag))
+    return (surv,
+            np.degrees(np.sqrt(pose_m)),
+            np.sqrt(root_m)*100,
+            np.sqrt(rvel_m),
+            float(act_s)/max(steps_run, 1))
 
 
 def main():

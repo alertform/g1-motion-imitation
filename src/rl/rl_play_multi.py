@@ -92,7 +92,8 @@ def main():
     # 每个实例一份独立的单机器人物理（算各自的状态），
     # 再把结果拷进合并场景里渲染——比在合并模型上直接跑简单可靠，
     # 因为观测/动作的下标都按单机器人定义。
-    rolls = [rl_play.NumpyRollout(np.asarray(ref[i]), np.asarray(refv[i]))
+    rolls = [rl_play.NumpyRollout(np.asarray(ref[i]), np.asarray(refv[i]),
+                                 clip=i, n_clip=n)
              for i in range(n)]
     steps = [0]*n
     lasts = [np.zeros(rl_env.NU) for _ in range(n)]

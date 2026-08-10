@@ -76,7 +76,7 @@ def main():
                          surv=s1.tolist()))
         print(f"  {nm:<30}{lens[ci]:>7}{s0.mean():>7.0f}{s1.mean():>7.0f}"
               f"{gain:>7.1f}{full:>4}/{a.episodes}{np.nanmedian(j1):>7.2f}"
-              f"{np.nanmedian(r1):>8.2f}")
+              f"{np.nanmedian(r1):>8.2f}", flush=True)   # 逐段刷出，别等全跑完
 
     print()
     g = np.array([r["gain"] for r in rows])

@@ -35,10 +35,24 @@ NQ = 36                      # 3 位置 + 4 四元数 + 29 关节
 NV = 35                      # 6 根自由度 + 29 关节
 LOOKAHEAD = 4                # 观测里包含参考动作的未来帧数
 
+# 动作条件（多段训练必需）。
+# v16 教训：8 段共训后逐段评估发现同类动作的不同 subject 表现差 4~6 倍，
+# 跑满率从单段的 94% 掉到 8%。观测里**没有任何标识告诉策略当前在跟哪段
+# 动作**——它只能从未来 4 帧的关节角去猜「这是走路还是冲刺」，而这两者
+# 的前 4 帧可能很接近，真正的差别要几十帧后才显现。
+# 用可学习 embedding 而非 one-hot：68 段时 one-hot 要占 68 维，
+# embedding 维度固定，且相似动作（walk 的三个 subject）能在空间里靠近。
+# 这里的 embedding 是**固定随机向量**（不参与梯度）——策略网络自己会学
+# 怎么用它，相当于给每段一个稳定的身份指纹。真正可学的 embedding 需要
+# 改网络结构，收益未必更大。
+CLIP_EMBED_DIM = 8
+
 # 观测维度：重力3 + 根角速度3 + 关节角29 + 关节角速度29 + 上一步动作29
-#           + 目标根速度(机身系)3 + 根位置误差(机身系)3 + 未来 K 帧关节角 4×29
+#           + 目标根速度(机身系)3 + 根位置误差(机身系)3 + 动作条件8
+#           + 未来 K 帧关节角 4×29
 # 定成常量而不是让三个脚本各算一遍——之前求解器设置就是各写一份而漂移过
-OBS_SIZE = 3 + 3 + NU + NU + NU + 3 + 3 + LOOKAHEAD * NU
+OBS_SIZE = (3 + 3 + NU + NU + NU + 3 + 3 + CLIP_EMBED_DIM
+            + LOOKAHEAD * NU)
 
 # 奖励的衰减系数。选取原则：在**关心的误差区间内**要有梯度。
 # exp(-k·e) 一旦饱和到 1e-3，策略就分不出 40° 和 20° 的好坏了。
@@ -276,6 +290,37 @@ def _finite_diff_qvel(qpos, dt):
     return v
 
 
+_FK_CACHE = DATASET.parent/"fk_cache"
+
+
+def _body_states_cached(name, qpos_seq, sim_dt=0.004):
+    """带磁盘缓存的 FK 预计算。
+
+    逐帧 mj_forward 是纯 CPU 单线程的：8 段 × 15286 帧 = 12 万次调用，
+    实测要十几分钟，评估脚本每次启动都得重来一遍。参考数据是固定的，
+    存盘即可。缓存键含帧数与配置常量——改了跟踪 body 列表或增益就失效。
+
+    注意传进来的必须是**补齐前**的原始序列：补齐长度取决于同批载入的
+    最长段，同一段在不同组合下会算出不同的键，缓存就白建了。
+    """
+    key = (f"{name}_{len(qpos_seq)}_{len(TRACK_BODIES)}"
+           f"_{ANCHOR_BODY}_{KP_SCALE:.0f}")
+    f = _FK_CACHE/f"{key}.npz"
+    if f.exists():
+        try:
+            z = np.load(f)
+            return z["body"], z["ncon"]
+        except Exception:
+            pass                      # 缓存坏了就重算
+    body, ncon = _body_states(qpos_seq, sim_dt)
+    try:
+        _FK_CACHE.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(f, body=body, ncon=ncon)
+    except Exception:
+        pass                          # 写不了缓存不影响正确性
+    return body, ncon
+
+
 def _body_states(qpos_seq, sim_dt=0.004):
     """对参考轨迹逐帧做 FK：跟踪 body 的世界系位置 + 触地 geom 计数。
 
@@ -341,11 +386,15 @@ def load_reference(names, ctrl_dt=0.02, max_frames=None):
         tail = np.repeat(arr[-1:], T - len(arr), axis=0)
         return np.concatenate([arr, tail], axis=0)
 
-    fk = [_body_states(pad(c)) for c in poses]
+    # FK 只算真实帧（缓存键才与批次组合无关），补齐留到之后做——
+    # 补齐区是末帧重复，其 FK 结果自然也是末帧的 FK 重复
+    fk = [_body_states_cached(n, c) for n, c in zip(keep, poses)]
+    bodies = [pad(b) for b, _ in fk]
+    ncons = [pad(nc.reshape(-1, 1)).reshape(-1) for _, nc in fk]
     return (jp.asarray(np.stack([pad(c) for c in poses]), dtype=jp.float32),
             jp.asarray(np.stack([pad(c) for c in vels]), dtype=jp.float32),
-            jp.asarray(np.stack([b for b, _ in fk]), dtype=jp.float32),
-            np.stack([n for _, n in fk]),        # (N, T) 接触数，numpy 即可
+            jp.asarray(np.stack(bodies), dtype=jp.float32),
+            np.stack(ncons),                     # (N, T) 接触数，numpy 即可
             lens)                                 # (N,) 各段真实长度
 
 
@@ -365,6 +414,15 @@ class G1Imitate(PipelineEnv):
         self._ref = ref_qpos                    # (N, T, NQ)，已重采样到控制率
         self._refv = ref_qvel                   # (N, T, NV)
         self._refb = ref_body                   # (N, T, 1+B, 3) 世界系身体位置
+
+        # 动作条件：每段一个固定随机向量作身份指纹（见 CLIP_EMBED_DIM）。
+        # 用固定种子生成——同一段在训练/评估/回放里必须拿到同一个向量，
+        # 否则策略认不出它学过的动作。
+        n_clip = ref_qpos.shape[0]
+        rng = np.random.default_rng(20260810)
+        emb = rng.standard_normal((n_clip, CLIP_EMBED_DIM)).astype(np.float32)
+        emb /= np.linalg.norm(emb, axis=1, keepdims=True)   # 单位化，量纲可控
+        self._clip_emb = jp.asarray(emb)
         # 机器人侧对应的 body id（顺序与 _body_states 一致：anchor 在前）
         self._body_ids = jp.asarray(
             [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, n)
@@ -472,6 +530,7 @@ class G1Imitate(PipelineEnv):
         rt = self._rot_t(qpos[3:7])
         return jp.concatenate([grav, qvel[3:6], qpos[7:], qvel[6:], last_act,
                                rt @ vt, rt @ perr,
+                               self._clip_emb[clip],      # 当前在跟哪段动作
                                self._ref_future(clip, step)])
 
     # ------------------------------------------------------------ 接口

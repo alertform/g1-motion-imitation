@@ -77,6 +77,9 @@ def main():
     ap.add_argument("--max-steps", type=int, default=500)
     ap.add_argument("--starts", default="",
                     help="逗号分隔的起始帧，指定后忽略 --episodes（用于定点复查）")
+    ap.add_argument("--clip-idx", type=int, default=0,
+                    help="该段在训练集里的索引（多段策略须对齐动作条件）")
+    ap.add_argument("--n-clip", type=int, default=1, help="训练时用了几段")
     a = ap.parse_args()
 
     import jax
@@ -84,7 +87,7 @@ def main():
 
     ref, refv, refb, refc, refl = rl_env.load_reference([a.clip])
     ref, refv = np.asarray(ref[0]), np.asarray(refv[0])
-    roll = rl_play.NumpyRollout(ref, refv)
+    roll = rl_play.NumpyRollout(ref, refv, clip=a.clip_idx, n_clip=a.n_clip)
 
     ckpt = pathlib.Path(a.ckpt)
     if not ckpt.is_absolute():
